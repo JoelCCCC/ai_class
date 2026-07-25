@@ -3,42 +3,8 @@ use regex::Regex;
 use serde_json::json;
 use tokio::fs;
 
+use super::glob_match::glob_match;
 use super::{Tool, ToolSpec};
-
-fn glob_match(pattern: &str, path: &str) -> bool {
-    let mut pi = 0;
-    let mut si = 0;
-    let mut star_idx = None;
-    let mut match_idx = 0;
-    let pattern_bytes = pattern.as_bytes();
-    let path_bytes = path.as_bytes();
-
-    while si < path_bytes.len() {
-        if pi < pattern_bytes.len() && pattern_bytes[pi] == b'*' {
-            star_idx = Some(pi);
-            match_idx = si;
-            pi += 1;
-        } else if pi < pattern_bytes.len() && pattern_bytes[pi] == b'?' {
-            pi += 1;
-            si += 1;
-        } else if pi < pattern_bytes.len() && pattern_bytes[pi] == path_bytes[si] {
-            pi += 1;
-            si += 1;
-        } else if let Some(si_val) = star_idx {
-            pi = si_val + 1;
-            match_idx += 1;
-            si = match_idx;
-        } else {
-            return false;
-        }
-    }
-
-    while pi < pattern_bytes.len() && pattern_bytes[pi] == b'*' {
-        pi += 1;
-    }
-
-    pi == pattern_bytes.len()
-}
 
 pub struct GrepTool;
 
@@ -53,7 +19,7 @@ impl Tool for GrepTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "grep".into(),
-            description: "Search for a regex pattern in files. Uses .gitignore-aware file search."
+            description: "Search file contents by regex. Required: pattern (regex string). Optional: path, include (file filter e.g. '*.rs'). .gitignore-aware."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -95,7 +61,7 @@ impl Tool for GrepTool {
         for entry in walker {
             let entry = entry?;
             let path = entry.path();
-            if !entry.file_type().map_or(false, |f| f.is_file()) {
+            if !entry.file_type().is_some_and(|f| f.is_file()) {
                 continue;
             }
             if let Some(include_pat) = include {

@@ -30,7 +30,8 @@ pub trait Tool: Send + Sync {
 
 pub mod bash;
 pub mod glob;
+pub mod glob_match;
 pub mod grep;
 pub mod read;
-pub mod write;
 pub mod registry;
+pub mod write;

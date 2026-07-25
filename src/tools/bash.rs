@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::time::Duration;
 use tokio::process::Command;
 
 use super::{Tool, ToolSpec};
+
+const BASH_TIMEOUT_SECS: u64 = 120;
 
 pub struct BashTool;
 
@@ -18,7 +21,7 @@ impl Tool for BashTool {
         ToolSpec {
             name: "bash".into(),
             description:
-                "Execute a bash command. Returns stdout and stderr. Commands run in the project directory."
+                "Execute a shell command. Required: command (string). Optional: workdir (directory). Non-interactive, no stdin."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -56,7 +59,11 @@ impl Tool for BashTool {
         };
 
         child.current_dir(workdir);
-        let output = child.output().await?;
+        let output = tokio::time::timeout(Duration::from_secs(BASH_TIMEOUT_SECS), child.output())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(format!("Command timed out after {}s", BASH_TIMEOUT_SECS))
+            })??;
 
         let mut result = String::new();
         if !output.stdout.is_empty() {
@@ -66,7 +73,10 @@ impl Tool for BashTool {
             result.push_str(&String::from_utf8_lossy(&output.stderr));
         }
         if result.is_empty() {
-            result.push_str(&format!("Command exited with code: {:?}", output.status.code()));
+            result.push_str(&format!(
+                "Command exited with code: {:?}",
+                output.status.code()
+            ));
         }
 
         Ok(result)

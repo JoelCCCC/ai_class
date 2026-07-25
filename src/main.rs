@@ -4,12 +4,14 @@ mod llm;
 mod tools;
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use agent::{AgentConfig, AgentEvent, AgentLoop};
+use cli::Command;
+use llm::Message;
 use tools::{
     bash::BashTool, glob::GlobTool, grep::GrepTool, read::ReadTool, registry::ToolRegistry,
     write::WriteTool,
@@ -22,11 +24,29 @@ struct Cli {
     #[arg(short, long, env = "AI_MODEL", default_value = "gpt-4o")]
     model: String,
 
-    #[arg(short, long, env = "AI_API_URL", default_value = "https://api.openai.com/v1")]
+    #[arg(
+        short,
+        long,
+        env = "AI_API_URL",
+        default_value = "https://api.openai.com/v1"
+    )]
     api_url: String,
 
     #[arg(short = 'k', long = "api-key", env = "AI_API_KEY")]
     api_key: Option<String>,
+
+    #[arg(long, env = "AI_MAX_TOKENS", default_value = "8192")]
+    max_tokens: u32,
+
+    #[arg(long, env = "AI_SESSION", default_value = "default")]
+    session: String,
+
+    #[arg(
+        short = 'l',
+        long = "local",
+        help = "Use local Ollama model (http://localhost:11434/v1)"
+    )]
+    local: bool,
 
     #[arg(short, long)]
     prompt: Option<String>,
@@ -37,21 +57,23 @@ struct Cli {
 
 const SYSTEM_PROMPT: &str = r#"You are an AI coding agent running in the terminal. You help users with software engineering tasks.
 
-You have access to tools for reading/writing files, running shell commands, and searching code.
+Available tools:
 
-Guidelines:
-- Be concise and direct. Keep responses short.
-- When reading files, use absolute paths.
-- When running bash commands, explain what they do.
-- Use the glob tool for finding files by pattern.
-- Use the grep tool to search file contents.
-- Never guess URLs unless confident they help with programming.
-- Always follow the user's code conventions when making changes.
+read - Read a file. Required: file_path (absolute path). Optional: offset (1-indexed line), limit (max lines).
+write - Write content to a file. Required: file_path (absolute path), content (string to write). Creates parent dirs.
+bash - Execute a shell command. Required: command (string). Optional: workdir (directory). Non-interactive, no stdin.
+glob - Find files by glob pattern. Required: pattern (e.g. '**/*.rs'). Optional: path (directory). .gitignore-aware.
+grep - Search file contents by regex. Required: pattern (regex string). Optional: path, include (file filter). .gitignore-aware.
 
-When the user asks you to make code changes:
-1. First read the relevant files
-2. Then use the write tool to make changes
-3. Verify with bash if needed
+Memory:
+There is a memory file in the working directory. Use `pwd` via bash to find the absolute path, then check for .ai-code-memory.md in that directory using the read tool. When the user shares noteworthy information, preferences, or project decisions, write to this file so you remember them for future conversations. If the file doesn't exist, skip it and continue.
+
+Rules:
+- Always use absolute paths for file operations.
+- Always respond in English, regardless of the user's language.
+- If a tool returns an error, fix the arguments and retry.
+- Do not call a tool name that is not in the list above.
+- Be concise and direct.
 "#;
 
 fn create_registry() -> ToolRegistry {
@@ -65,8 +87,111 @@ fn create_registry() -> ToolRegistry {
     registry
 }
 
-async fn run_repl(config: AgentConfig) -> anyhow::Result<()> {
+fn session_path(cwd: &Path, name: &str) -> PathBuf {
+    let cwd_slug = cwd.to_string_lossy().replace('/', "__");
+    let base = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".config")
+        .join("ai-code")
+        .join("sessions")
+        .join(&cwd_slug);
+    let _ = std::fs::create_dir_all(&base);
+    base.join(format!("{}.json", name))
+}
+
+fn load_session_into_tui(tui: &mut cli::Tui, messages: &[Message]) {
+    for msg in messages {
+        match msg.role.as_str() {
+            "user" => {
+                if let Some(ref content) = msg.content {
+                    tui.push_user_message(content.clone());
+                }
+            }
+            "assistant" => {
+                if let Some(ref tcs) = msg.tool_calls {
+                    for tc in tcs {
+                        let name = tc.name.as_deref().unwrap_or("unknown");
+                        tui.push_tool_start(name.to_string());
+                    }
+                }
+                if let Some(ref content) = msg.content {
+                    if !content.is_empty() {
+                        tui.push_assistant_message(content.clone());
+                    }
+                }
+            }
+            "tool" => {
+                if let Some(ref content) = msg.content {
+                    let is_error = content.starts_with("Error");
+                    tui.push_tool_result(content.clone(), is_error);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn configure_api_key(key: &str) {
+    let config_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".config")
+        .join("ai-code")
+        .join(".env");
+    let _ = std::fs::create_dir_all(config_path.parent().unwrap());
+    let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    let key_line = format!("AI_API_KEY={}", key);
+    if content.contains("AI_API_KEY=") {
+        let mut updated = Vec::new();
+        for line in content.lines() {
+            if line.starts_with("AI_API_KEY=") {
+                updated.push(key_line.as_str());
+            } else {
+                updated.push(line);
+            }
+        }
+        content = updated.join("\n") + "\n";
+    } else {
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&key_line);
+        content.push('\n');
+    }
+    let _ = std::fs::write(&config_path, content);
+}
+
+fn parse_model_name(name: &str) -> (String, Option<String>) {
+    if let Some(stripped) = name.strip_prefix("[local] ") {
+        (
+            stripped.to_string(),
+            Some("http://localhost:11434/v1".to_string()),
+        )
+    } else {
+        (name.to_string(), None)
+    }
+}
+
+fn extract_host(url: &str) -> String {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .to_string()
+}
+
+async fn run_repl(config: AgentConfig, session_name: String, cwd: &Path) -> anyhow::Result<()> {
     let mut tui = cli::Tui::new()?;
+
+    let host = extract_host(&config.base_url);
+    tui.set_model_info(&format!("{} @ {}", config.model, host), &config.base_url);
+
+    let mut session_file = session_path(cwd, &session_name);
+
+    enum ConfirmState {
+        None,
+        Waiting { tx: oneshot::Sender<bool> },
+    }
+    let mut confirm_state = ConfirmState::None;
 
     let (crossterm_tx, mut crossterm_rx) = mpsc::unbounded_channel::<crossterm::event::Event>();
 
@@ -78,9 +203,28 @@ async fn run_repl(config: AgentConfig) -> anyhow::Result<()> {
         }
     });
 
-    let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut agent_session = Some(AgentLoop::new(config.clone(), create_registry()));
+
+    if session_file.exists() {
+        if let Some(ref mut agent) = agent_session {
+            match agent.load_from_file(&session_file) {
+                Ok(()) => {
+                    let msgs = agent.messages().to_vec();
+                    load_session_into_tui(&mut tui, &msgs);
+                    tui.push_system_message(format!("Loaded session: {}", session_file.display()));
+                }
+                Err(e) => {
+                    tui.push_system_message(format!("Failed to load session: {}", e));
+                }
+            }
+        }
+    }
+
+    type AgentJoinHandle = tokio::task::JoinHandle<(AgentLoop, anyhow::Result<String>)>;
+    let mut agent_handle: Option<AgentJoinHandle> = None;
     let mut agent_rx: Option<mpsc::UnboundedReceiver<AgentEvent>> = None;
     let mut is_agent_running = false;
+    let mut pending_model: Option<String> = None;
 
     loop {
         tui.draw()?;
@@ -90,25 +234,105 @@ async fn run_repl(config: AgentConfig) -> anyhow::Result<()> {
                 Some(event) = crossterm_rx.recv() => {
                     tui.handle_input(event);
 
+                    if let Some(cmd) = tui.take_command() {
+                        match cmd {
+                            Command::SwitchSession(name) => {
+                                let new_path = session_path(cwd, &name);
+                                if new_path.exists() {
+                                    let mut new_agent = AgentLoop::new(config.clone(), create_registry());
+                                    if let Err(e) = new_agent.load_from_file(&new_path) {
+                                        tui.push_system_message(format!("Failed to load session: {}", e));
+                                    } else {
+                                        let msgs = new_agent.messages().to_vec();
+                                        tui.clear_chat();
+                                        load_session_into_tui(&mut tui, &msgs);
+                                        tui.push_system_message(format!(
+                                            "Switched to session: {}",
+                                            new_path.display()
+                                        ));
+                                        agent_session = Some(new_agent);
+                                        let _ = std::fs::remove_file(&session_file);
+                                        session_file = new_path;
+                                    }
+                                } else {
+                                    tui.push_system_message(format!("Session not found: {}", name));
+                                }
+                            }
+                            Command::SwitchModel(name) => {
+                                let (model, new_url) = parse_model_name(&name);
+                                if let Some(ref mut agent) = agent_session {
+                                    agent.update_model(model.clone());
+                                    if let Some(ref url) = new_url {
+                                        agent.update_url(url.clone());
+                                    }
+                                } else {
+                                    pending_model = Some(name.clone());
+                                }
+                                let real_url = new_url.as_deref().unwrap_or(&config.base_url);
+                                tui.set_model_info(&format!("{} @ {}", model, extract_host(real_url)), real_url);
+                                tui.push_system_message(format!("Switched model to: {}", model));
+                            }
+                            Command::ConfigureApi { key } => {
+                                configure_api_key(&key);
+                                tui.push_system_message(
+                                    "API key updated in ~/.config/ai-code/.env. Restart to use new key.".into(),
+                                );
+                            }
+                            Command::ClearChat => {
+                                let new_agent = AgentLoop::new(config.clone(), create_registry());
+                                agent_session = Some(new_agent);
+                                tui.clear_chat();
+                                let _ = std::fs::remove_file(&session_file);
+                            }
+                            Command::Quit => {
+                                tui.set_quit();
+                            }
+                        }
+                    }
+
                     if tui.quit() {
+                        if let Some(ref agent) = agent_session {
+                            let _ = agent.save_to_file(&session_file);
+                        }
                         break;
+                    }
+
+                    if tui.menu_active() {
+                        continue;
                     }
 
                     if let Some(input) = tui.take_input() {
                         let input_lower = input.to_lowercase();
                         if input_lower == "/quit" || input_lower == "/q" || input_lower == "/exit" {
+                            if let Some(ref agent) = agent_session {
+                                let _ = agent.save_to_file(&session_file);
+                            }
                             break;
+                        }
+                        if input_lower == "/clear" {
+                            let new_agent = AgentLoop::new(config.clone(), create_registry());
+                            agent_session = Some(new_agent);
+                            tui.clear_chat();
+                            let _ = std::fs::remove_file(&session_file);
+                            continue;
+                        }
+                        if input_lower == "/help" {
+                            tui.push_system_message(
+                            "Ctrl+X: Menu  |  Commands: /help, /clear, /quit, /q, /exit  |  Keys: Enter=send, Esc=quit, PgUp/PgDn/mouse=scroll"
+                                .into(),
+                        );
+                            continue;
                         }
 
                         let (tx, rx) = mpsc::unbounded_channel();
-                        let mut agent_loop = AgentLoop::new(config.clone(), create_registry());
+                        let mut agent_loop = agent_session.take()
+                            .unwrap_or_else(|| AgentLoop::new(config.clone(), create_registry()));
                         agent_loop.add_user_message(input);
                         is_agent_running = true;
 
                         let handle = tokio::spawn(async move {
-                            if let Err(e) = agent_loop.run(tx).await {
-                                eprintln!("Agent error: {}", e);
-                            }
+                            let result = agent_loop.run(tx).await;
+                            (agent_loop, result)
                         });
 
                         agent_handle = Some(handle);
@@ -119,13 +343,70 @@ async fn run_repl(config: AgentConfig) -> anyhow::Result<()> {
         } else {
             tokio::select! {
                 Some(event) = crossterm_rx.recv() => {
-                    tui.handle_input(event);
-                    if tui.quit() {
-                        break;
+                    match &confirm_state {
+                        ConfirmState::Waiting { .. } => {
+                            if let crossterm::event::Event::Key(key) = &event {
+                                if key.kind == crossterm::event::KeyEventKind::Press {
+                                    let allow = match key.code {
+                                        crossterm::event::KeyCode::Char('y') |
+                                        crossterm::event::KeyCode::Char('Y') => Some(true),
+                                        crossterm::event::KeyCode::Char('n') |
+                                        crossterm::event::KeyCode::Char('N') => Some(false),
+                                        _ => None,
+                                    };
+                                    if let Some(allow) = allow {
+                                        if let ConfirmState::Waiting { tx } = std::mem::replace(&mut confirm_state, ConfirmState::None) {
+                                            let _ = tx.send(allow);
+                                            tui.clear_confirm();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ConfirmState::None => {
+                            tui.handle_input(event);
+                            if let Some(cmd) = tui.take_command() {
+                                match cmd {
+                                    Command::Quit => tui.set_quit(),
+                                    Command::ClearChat => {
+                                        is_agent_running = false;
+                                        agent_rx = None;
+                                        if let Some(handle) = agent_handle.take() {
+                                            handle.abort();
+                                        }
+                                        let new_agent = AgentLoop::new(config.clone(), create_registry());
+                                        agent_session = Some(new_agent);
+                                        tui.clear_chat();
+                                        let _ = std::fs::remove_file(&session_file);
+                                    }
+                                    Command::SwitchModel(name) => {
+                                        let (model, new_url) = parse_model_name(&name);
+                                        if let Some(ref mut agent) = agent_session {
+                                            agent.update_model(model.clone());
+                                            if let Some(ref url) = new_url {
+                                                agent.update_url(url.clone());
+                                            }
+                                        } else {
+                                            pending_model = Some(name.clone());
+                                        }
+                                        let real_url = new_url.as_deref().unwrap_or(&config.base_url);
+                                        tui.set_model_info(&format!("{} @ {}", model, extract_host(real_url)), real_url);
+                                        tui.push_system_message(format!("Switched model to: {}", model));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if tui.quit() {
+                                break;
+                            }
+                        }
                     }
                 }
                 event = async {
-                    agent_rx.as_mut().unwrap().recv().await
+                    match agent_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
                 } => {
                     if let Some(ev) = event {
                         let is_done = matches!(ev, AgentEvent::Done | AgentEvent::Error(_));
@@ -133,15 +414,59 @@ async fn run_repl(config: AgentConfig) -> anyhow::Result<()> {
                             is_agent_running = false;
                             agent_rx = None;
                             if let Some(handle) = agent_handle.take() {
-                                handle.abort();
+                                match handle.await {
+                                    Ok((loop_back, result)) => {
+                                        let mut agent = loop_back;
+                                        if let Some(ref model) = pending_model.take() {
+                                            let (m, url) = parse_model_name(model);
+                                            agent.update_model(m);
+                                            if let Some(u) = url {
+                                                agent.update_url(u);
+                                            }
+                                        }
+                                        if let Err(e) = &result {
+                                            tui.push_system_message(format!("Agent error: {}", e));
+                                        }
+                                        let _ = agent.save_to_file(&session_file);
+                                        agent_session = Some(agent);
+                                    }
+                                    Err(join_err) => {
+                                        eprintln!("Agent task panicked: {}", join_err);
+                                        agent_session = Some(AgentLoop::new(config.clone(), create_registry()));
+                                    }
+                                }
                             }
                         }
-                        tui.handle_agent_event(ev);
+                        match ev {
+                            AgentEvent::WriteRequest { path, resume } => {
+                                confirm_state = ConfirmState::Waiting { tx: resume };
+                                tui.show_confirm(&path);
+                            }
+                            other => tui.handle_agent_event(other),
+                        }
                     } else {
                         is_agent_running = false;
                         agent_rx = None;
                         if let Some(handle) = agent_handle.take() {
-                            handle.abort();
+                            match handle.await {
+                                Ok((loop_back, result)) => {
+                                    let mut agent = loop_back;
+                                    if let Some(ref model) = pending_model.take() {
+                                        let (m, url) = parse_model_name(model);
+                                        agent.update_model(m);
+                                        if let Some(u) = url {
+                                            agent.update_url(u);
+                                        }
+                                    }
+                                    if let Err(e) = &result {
+                                        tui.push_system_message(format!("Agent error: {}", e));
+                                    }
+                                    agent_session = Some(agent);
+                                }
+                                Err(_) => {
+                                    agent_session = Some(AgentLoop::new(config.clone(), create_registry()));
+                                }
+                            }
                         }
                     }
                 }
@@ -151,8 +476,12 @@ async fn run_repl(config: AgentConfig) -> anyhow::Result<()> {
 
     if let Some(handle) = agent_handle.take() {
         handle.abort();
+        let _ = handle.await;
     }
 
+    if let Some(ref agent) = agent_session {
+        let _ = agent.save_to_file(&session_file);
+    }
     tui.shutdown()?;
     Ok(())
 }
@@ -183,6 +512,9 @@ async fn run_single_prompt(config: AgentConfig, prompt: String) -> anyhow::Resul
             AgentEvent::Done => {
                 println!();
             }
+            AgentEvent::WriteRequest { path, .. } => {
+                eprintln!("\nWrite denied: {} (no TUI to confirm)", path);
+            }
             _ => {}
         }
     }
@@ -193,13 +525,25 @@ async fn run_single_prompt(config: AgentConfig, prompt: String) -> anyhow::Resul
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     let home_config = dirs::home_dir().map(|h| h.join(".config").join("ai-code").join(".env"));
     if let Some(ref path) = home_config {
         dotenvy::from_path(path).ok();
     }
-    dotenvy::dotenv().ok();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    if cli.local {
+        if cli.api_url == "https://api.openai.com/v1" {
+            cli.api_url = "http://localhost:11434/v1".into();
+        }
+        if cli.model == "gpt-4o" {
+            cli.model = "llama3.2".into();
+        }
+    }
+
+    let is_local = cli.api_url.starts_with("http://localhost:")
+        || cli.api_url.starts_with("http://127.0.0.1:");
 
     std::env::set_current_dir(&cli.directory)?;
 
@@ -211,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_default()
     });
 
-    if api_key.is_empty() {
+    if api_key.is_empty() && !is_local {
         let cfg_path = dirs::home_dir()
             .map(|h| h.join(".config").join("ai-code").join(".env"))
             .unwrap_or_default();
@@ -220,6 +564,7 @@ async fn main() -> anyhow::Result<()> {
              \n  Add your key to {}:\n\
              \n    AI_API_KEY=sk-your-key\n    AI_MODEL=deepseek-chat\n    AI_API_URL=https://api.deepseek.com/v1\n\
              \n  Or set it via environment: export AI_API_KEY=sk-...\n\
+             \n  Or use a local model: cargo run -- --local\n\
              ",
             cfg_path.display()
         );
@@ -231,12 +576,14 @@ async fn main() -> anyhow::Result<()> {
         model: cli.model,
         api_key,
         base_url: cli.api_url,
+        max_tokens: cli.max_tokens,
     };
 
     if let Some(prompt) = cli.prompt {
         run_single_prompt(config, prompt).await?;
     } else {
-        run_repl(config).await?;
+        let cwd = std::env::current_dir()?;
+        run_repl(config, cli.session, &cwd).await?;
     }
 
     Ok(())

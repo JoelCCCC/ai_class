@@ -1,3 +1,4 @@
+use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::fs;
@@ -17,7 +18,7 @@ impl Tool for WriteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write".into(),
-            description: "Write content to a file on the filesystem. Creates parent directories if needed.".into(),
+            description: "Write content to a file. Required: file_path (absolute path), content (string to write). Creates parent dirs.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -44,10 +45,14 @@ impl Tool for WriteTool {
         }
 
         if let Some(parent) = std::path::Path::new(path).parent() {
-            fs::create_dir_all(parent).await?;
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("Failed to create directory for {}", path))?;
         }
 
-        fs::write(path, content).await?;
+        fs::write(path, content)
+            .await
+            .with_context(|| format!("Failed to write {}", path))?;
 
         Ok(format!("Successfully wrote file: {}", path))
     }

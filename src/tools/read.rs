@@ -1,3 +1,4 @@
+use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::fs;
@@ -17,7 +18,7 @@ impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read".into(),
-            description: "Read a file from the filesystem. Returns the file contents with line numbers.".into(),
+            description: "Read a file. Required: file_path (absolute path). Optional: offset (1-indexed line), limit (max lines). Returns content with line numbers.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -48,8 +49,14 @@ impl Tool for ReadTool {
             return Err(anyhow::anyhow!("file_path is required"));
         }
 
-        let content = fs::read_to_string(path).await?;
+        let content = fs::read_to_string(path)
+            .await
+            .with_context(|| format!("Failed to read {}", path))?;
         let lines: Vec<&str> = content.lines().collect();
+
+        if lines.is_empty() {
+            return Ok("File is empty.".into());
+        }
 
         let start = offset.saturating_sub(1);
         let end = limit.map_or(lines.len(), |l| (start + l).min(lines.len()));
