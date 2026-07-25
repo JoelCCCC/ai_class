@@ -35,6 +35,7 @@ pub enum Command {
     SwitchModel(String),
     ConfigureApi { key: String },
     ClearChat,
+    TogglePlanning,
     Quit,
 }
 
@@ -78,12 +79,14 @@ struct App {
     pending_command: Option<Command>,
     model_info: String,
     current_api_url: String,
+    is_planning: bool,
 }
 
 const MENU_ITEMS: &[&str] = &[
     "Switch Session",
     "Switch Model",
     "Configure API",
+    "Toggle Planning Mode",
     "Clear Chat",
     "Help",
     "Quit",
@@ -119,6 +122,7 @@ impl App {
             pending_command: None,
             model_info: String::new(),
             current_api_url: String::new(),
+            is_planning: false,
         }
     }
 
@@ -259,13 +263,17 @@ impl App {
                         };
                     }
                     3 => {
-                        self.pending_command = Some(Command::ClearChat);
+                        self.pending_command = Some(Command::TogglePlanning);
                         self.sub_menu = SubMenu::None;
                     }
                     4 => {
-                        self.sub_menu = SubMenu::Help;
+                        self.pending_command = Some(Command::ClearChat);
+                        self.sub_menu = SubMenu::None;
                     }
                     5 => {
+                        self.sub_menu = SubMenu::Help;
+                    }
+                    6 => {
                         self.pending_command = Some(Command::Quit);
                         self.sub_menu = SubMenu::None;
                     }
@@ -532,6 +540,14 @@ impl Tui {
         self.app.current_api_url = api_url.to_string();
     }
 
+    pub fn set_planning(&mut self, planning: bool) {
+        self.app.is_planning = planning;
+    }
+
+    pub fn is_planning(&self) -> bool {
+        self.app.is_planning
+    }
+
     pub fn push_system_message(&mut self, msg: String) {
         self.app.messages.push(ChatLine::System(msg));
     }
@@ -619,6 +635,13 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         (format!(" {} {}", spinner_char(), app.status), Color::Yellow)
     } else if !app.status.is_empty() {
         (format!(" {}", app.status), Color::Cyan)
+    } else if app.is_planning {
+        let prefix = if app.model_info.is_empty() {
+            " Planning (read-only)  |  Ctrl+X: Menu".into()
+        } else {
+            format!(" Planning  |  {}  |  Ctrl+X: Menu", app.model_info)
+        };
+        (prefix, Color::Blue)
     } else {
         let prefix = if app.model_info.is_empty() {
             " Ready  |  Ctrl+X: Menu".into()
