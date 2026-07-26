@@ -1,11 +1,13 @@
 mod agent;
 mod cli;
+mod experts;
 mod llm;
+mod teams;
 mod tools;
 
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use clap::Parser;
 use tokio::sync::{mpsc, oneshot};
@@ -13,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use agent::{AgentConfig, AgentEvent, AgentLoop};
 use cli::Command;
 use llm::Message;
+use teams::TeamConfig;
 use tools::{
     bash::BashTool, fetch::FetchTool, glob::GlobTool, grep::GrepTool, read::ReadTool,
     registry::ToolRegistry, subagent::SubAgentTool, write::WriteTool,
@@ -84,7 +87,10 @@ Rules:
 - Use fetch to look up documentation, crates.io versions, API references, etc.
 "#;
 
-fn create_registry(config: &AgentConfig) -> Arc<ToolRegistry> {
+fn create_registry(
+    config: &AgentConfig,
+    active_team: Arc<RwLock<Option<TeamConfig>>>,
+) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
     registry
         .register(ReadTool::new())
@@ -92,11 +98,9 @@ fn create_registry(config: &AgentConfig) -> Arc<ToolRegistry> {
         .register(BashTool::new())
         .register(GlobTool::new())
         .register(GrepTool::new())
-        .register(FetchTool::new());
-    let mut registry = Arc::new(registry);
-    let sub_agent = SubAgentTool::new(config.clone(), &registry);
-    Arc::get_mut(&mut registry).unwrap().register(sub_agent);
-    registry
+        .register(FetchTool::new())
+        .register(SubAgentTool::new(config.clone(), active_team));
+    Arc::new(registry)
 }
 
 fn session_path(cwd: &Path, name: &str) -> PathBuf {
@@ -196,6 +200,7 @@ async fn run_repl(
     session_name: String,
     cwd: &Path,
     is_planning: bool,
+    active_team: Arc<RwLock<Option<TeamConfig>>>,
 ) -> anyhow::Result<()> {
     let mut tui = cli::Tui::new()?;
 
@@ -203,14 +208,48 @@ async fn run_repl(
     tui.set_model_info(&format!("{} @ {}", config.model, host), &config.base_url);
     tui.set_planning(is_planning);
 
-    let planning_prompt = format!(
-        "{}\n\nCurrent mode: PLANNING — Research and plan only. Do not write any files. Use read, glob, grep, fetch, and subagent to gather information and produce a plan for the user to review.",
-        SYSTEM_PROMPT
-    );
-    let execution_prompt = format!(
-        "{}\n\nCurrent mode: EXECUTION — Full access to all tools including write. Implement the plan.",
-        SYSTEM_PROMPT
-    );
+    teams::ensure_defaults();
+    experts::ensure_defaults();
+
+    let detected = experts::detect_project(cwd);
+    let (mut active_expert_slug, mut active_expert_prompt) = if let Some((slug, profile)) = detected
+    {
+        tui.push_system_message(format!("Auto-detected expert: {} ({})", profile.name, slug));
+        (slug, profile.prompt)
+    } else {
+        (String::new(), String::new())
+    };
+
+    let make_prompts = |expert_prompt: &str, team_prompt: &str| {
+        let mut base = if expert_prompt.is_empty() {
+            SYSTEM_PROMPT.to_string()
+        } else {
+            format!(
+                "{}\n\n--- Expert profile ---\n{}",
+                SYSTEM_PROMPT, expert_prompt
+            )
+        };
+        if !team_prompt.is_empty() {
+            base = format!("{}\n\n--- Team: ---\n{}", base, team_prompt);
+        }
+        let planning = format!(
+            "{}\n\nCurrent mode: PLANNING — Research and plan only. Do not write any files. Use read, glob, grep, fetch, and subagent to gather information and produce a plan for the user to review.",
+            base
+        );
+        let execution = format!(
+            "{}\n\nCurrent mode: EXECUTION — Full access to all tools including write. Implement the plan.",
+            base
+        );
+        (planning, execution)
+    };
+
+    let mut team_prompt = active_team
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|t| t.prompt.clone()))
+        .unwrap_or_default();
+
+    let (planning_prompt, execution_prompt) = make_prompts(&active_expert_prompt, &team_prompt);
 
     if is_planning {
         config.system_prompt = planning_prompt.clone();
@@ -236,7 +275,7 @@ async fn run_repl(
         }
     });
 
-    let registry = create_registry(&config);
+    let registry = create_registry(&config, Arc::clone(&active_team));
     let mut agent_session = Some(AgentLoop::new(config.clone(), Arc::clone(&registry)));
 
     if session_file.exists() {
@@ -314,17 +353,78 @@ async fn run_repl(
                             }
                             Command::TogglePlanning => {
                                 let new_mode = !tui.is_planning();
-                                config.system_prompt = if new_mode {
-                                    planning_prompt.clone()
-                                } else {
-                                    execution_prompt.clone()
-                                };
+                                let (p, e) = make_prompts(&active_expert_prompt, &team_prompt);
+                                config.system_prompt = if new_mode { p } else { e };
                                 tui.set_planning(new_mode);
                                 tui.push_system_message(if new_mode {
                                     "Switched to planning mode — research and plan only.".into()
                                 } else {
-                                    "Switched to execution mode — full tool access.".into()
-                                });
+                                     "Switched to execution mode — full tool access.".into()
+                                 });
+                             }
+                             Command::ToggleTheme => {
+                                 let new_theme = tui.toggle_theme();
+                                 tui.push_system_message(format!(
+                                     "Switched to {} theme",
+                                     if new_theme == cli::Theme::Dark { "dark" } else { "light" }
+                                 ));
+                             }
+                             Command::SwitchExpert(slug) => {
+                                if slug == "_general" {
+                                    active_expert_slug = String::new();
+                                    active_expert_prompt = String::new();
+                                    let (p, e) = make_prompts("", &team_prompt);
+                                    if tui.is_planning() {
+                                        config.system_prompt = p;
+                                    } else {
+                                        config.system_prompt = e;
+                                    }
+                                    let new_agent = AgentLoop::new(config.clone(), Arc::clone(&registry));
+                                    agent_session = Some(new_agent);
+                                    tui.clear_chat();
+                                    tui.push_system_message("Switched to General (no specialization).".into());
+                                } else if let Some(profile) = experts::load_profile(&slug) {
+                                    active_expert_slug = slug.clone();
+                                    active_expert_prompt = profile.prompt.clone();
+                                    let (p, e) = make_prompts(&active_expert_prompt, &team_prompt);
+                                    if tui.is_planning() {
+                                        config.system_prompt = p;
+                                    } else {
+                                        config.system_prompt = e;
+                                    }
+                                    let new_agent = AgentLoop::new(config.clone(), Arc::clone(&registry));
+                                    agent_session = Some(new_agent);
+                                    tui.clear_chat();
+                                    let _ = std::fs::remove_file(&session_file);
+                                    tui.push_system_message(format!("Switched expert to: {} ({}), chat cleared.", profile.name, slug));
+                                } else {
+                                    tui.push_system_message(format!("Expert '{}' not found.", slug));
+                                }
+                            }
+                            Command::SwitchTeam(slug) => {
+                                if slug == "_none" {
+                                    *active_team.write().unwrap() = None;
+                                    team_prompt = String::new();
+                                } else if let Some(team) = teams::load_team(&slug) {
+                                    let prompt = team.prompt.clone();
+                                    *active_team.write().unwrap() = Some(team);
+                                    team_prompt = prompt;
+                                }
+                                let (p, e) = make_prompts(&active_expert_prompt, &team_prompt);
+                                if tui.is_planning() {
+                                    config.system_prompt = p;
+                                } else {
+                                    config.system_prompt = e;
+                                }
+                                let new_agent = AgentLoop::new(config.clone(), Arc::clone(&registry));
+                                agent_session = Some(new_agent);
+                                tui.clear_chat();
+                                let _ = std::fs::remove_file(&session_file);
+                                if team_prompt.is_empty() {
+                                    tui.push_system_message("Deactivated team mode, chat cleared.".into());
+                                } else {
+                                    tui.push_system_message("Team activated, chat cleared. Use subagent with role prefixes.".into());
+                                }
                             }
                             Command::ClearChat => {
                                 let new_agent = AgentLoop::new(config.clone(), Arc::clone(&registry));
@@ -366,7 +466,7 @@ async fn run_repl(
                         }
                         if input_lower == "/help" {
                             tui.push_system_message(
-                            "Ctrl+X: Menu  |  Commands: /help, /plan, /execute, /clear, /quit, /q, /exit  |  Keys: Enter=send, Esc=quit, PgUp/PgDn/mouse=scroll"
+                            "Ctrl+X: Menu  |  Commands: /help, /plan, /execute, /expert, /clear, /quit, /q, /exit  |  Keys: Enter=send, Esc=quit, PgUp/PgDn/mouse=scroll"
                                 .into(),
                         );
                             continue;
@@ -381,6 +481,45 @@ async fn run_repl(
                             config.system_prompt = execution_prompt.clone();
                             tui.set_planning(false);
                             tui.push_system_message("Switched to execution mode — full tool access.".into());
+                            continue;
+                        }
+                        if input_lower.starts_with("/expert") {
+                            let arg = input_lower.strip_prefix("/expert").unwrap().trim();
+                            if arg.is_empty() || arg == "list" {
+                                let profiles = experts::list_profiles();
+                                let mut list = "Available experts:\n".to_string();
+                                if active_expert_slug.is_empty() {
+                                    list.push_str("  Active: General\n");
+                                }
+                                for (slug, profile) in &profiles {
+                                    let active = if *slug == active_expert_slug { " (active)" } else { "" };
+                                    list.push_str(&format!("  {} — {}{}\n", slug, profile.name, active));
+                                }
+                                list.push_str("  Type /expert <name> to switch or /expert general for default.");
+                                tui.push_system_message(list);
+                            } else if arg == "general" {
+                                active_expert_slug = String::new();
+                                active_expert_prompt = String::new();
+                                let (p, e) = make_prompts("", &team_prompt);
+                                if tui.is_planning() {
+                                    config.system_prompt = p;
+                                } else {
+                                    config.system_prompt = e;
+                                }
+                                tui.push_system_message("Switched to General (no specialization).".into());
+                            } else if let Some(profile) = experts::load_profile(arg) {
+                                active_expert_slug = arg.to_string();
+                                active_expert_prompt = profile.prompt.clone();
+                                let (p, e) = make_prompts(&profile.prompt, &team_prompt);
+                                if tui.is_planning() {
+                                    config.system_prompt = p;
+                                } else {
+                                    config.system_prompt = e;
+                                }
+                                tui.push_system_message(format!("Switched expert to: {} ({})", profile.name, arg));
+                            } else {
+                                tui.push_system_message(format!("Expert '{}' not found. Use /expert list to see available.", arg));
+                            }
                             continue;
                         }
 
@@ -455,17 +594,67 @@ async fn run_repl(
                                     }
                                     Command::TogglePlanning => {
                                         let new_mode = !tui.is_planning();
-                                        config.system_prompt = if new_mode {
-                                            planning_prompt.clone()
-                                        } else {
-                                            execution_prompt.clone()
-                                        };
+                                        let (p, e) = make_prompts(&active_expert_prompt, &team_prompt);
+                                        config.system_prompt = if new_mode { p } else { e };
                                         tui.set_planning(new_mode);
                                         tui.push_system_message(if new_mode {
                                             "Will switch to planning mode on next message".into()
                                         } else {
                                             "Will switch to execution mode on next message".into()
                                         });
+                                    }
+                                    Command::ToggleTheme => {
+                                        tui.toggle_theme();
+                                        tui.push_system_message("Toggled theme".into());
+                                    }
+                                    Command::SwitchExpert(slug) => {
+                                        is_agent_running = false;
+                                        agent_rx = None;
+                                        if let Some(handle) = agent_handle.take() {
+                                            handle.abort();
+                                        }
+                                        if slug == "_general" {
+                                            active_expert_slug = String::new();
+                                            active_expert_prompt = String::new();
+                                            tui.push_system_message(
+                                                "Switched to General (no specialization), chat cleared."
+                                                    .to_string(),
+                                            );
+                                        } else if let Some(profile) =
+                                            experts::load_profile(&slug)
+                                        {
+                                            active_expert_slug = slug;
+                                            active_expert_prompt =
+                                                profile.prompt.clone();
+                                            tui.push_system_message(
+                                                format!("Switched expert to: {} ({}), chat cleared.", profile.name, active_expert_slug),
+                                            );
+                                        }
+                                        let new_agent = AgentLoop::new(config.clone(), Arc::clone(&registry));
+                                        agent_session = Some(new_agent);
+                                        tui.clear_chat();
+                                        let _ = std::fs::remove_file(&session_file);
+                                    }
+                                    Command::SwitchTeam(slug) => {
+                                        is_agent_running = false;
+                                        agent_rx = None;
+                                        if let Some(handle) = agent_handle.take() {
+                                            handle.abort();
+                                        }
+                                        if slug == "_none" {
+                                            *active_team.write().unwrap() = None;
+                                            team_prompt = String::new();
+                                            tui.push_system_message("Deactivated team mode, chat cleared.".into());
+                                        } else if let Some(team) = teams::load_team(&slug) {
+                                            let prompt = team.prompt.clone();
+                                            *active_team.write().unwrap() = Some(team);
+                                            team_prompt = prompt;
+                                            tui.push_system_message("Team activated, chat cleared. Use subagent with role prefixes.".into());
+                                        }
+                                        let new_agent = AgentLoop::new(config.clone(), Arc::clone(&registry));
+                                        agent_session = Some(new_agent);
+                                        tui.clear_chat();
+                                        let _ = std::fs::remove_file(&session_file);
                                     }
                                     _ => {}
                                 }
@@ -563,7 +752,11 @@ async fn run_repl(
 async fn run_single_prompt(config: AgentConfig, prompt: String) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let registry = create_registry(&config);
+    teams::ensure_defaults();
+    experts::ensure_defaults();
+
+    let active_team: Arc<RwLock<Option<TeamConfig>>> = Arc::new(RwLock::new(None));
+    let registry = create_registry(&config, active_team);
     let mut agent = AgentLoop::new(config, Arc::clone(&registry));
     agent.add_user_message(prompt);
 
@@ -658,7 +851,8 @@ async fn main() -> anyhow::Result<()> {
         run_single_prompt(config, prompt).await?;
     } else {
         let cwd = std::env::current_dir()?;
-        run_repl(config, cli.session, &cwd, cli.plan).await?;
+        let active_team: Arc<RwLock<Option<TeamConfig>>> = Arc::new(RwLock::new(None));
+        run_repl(config, cli.session, &cwd, cli.plan, active_team).await?;
     }
 
     Ok(())
