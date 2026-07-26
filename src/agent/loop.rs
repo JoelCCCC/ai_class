@@ -39,10 +39,11 @@ pub struct AgentLoop {
     registry: Arc<ToolRegistry>,
     pub config: AgentConfig,
     messages: Vec<Message>,
+    deny_writes: bool,
 }
 
 impl AgentLoop {
-    pub fn new(config: AgentConfig, registry: ToolRegistry) -> Self {
+    pub fn new(config: AgentConfig, registry: Arc<ToolRegistry>) -> Self {
         Self {
             client: LlmClient::new(
                 config.api_key.clone(),
@@ -50,9 +51,25 @@ impl AgentLoop {
                 config.base_url.clone(),
                 config.max_tokens,
             ),
-            registry: Arc::new(registry),
+            registry,
             config,
             messages: Vec::new(),
+            deny_writes: false,
+        }
+    }
+
+    pub fn new_subagent(config: AgentConfig, registry: &Arc<ToolRegistry>) -> Self {
+        Self {
+            client: LlmClient::new(
+                config.api_key.clone(),
+                config.model.clone(),
+                config.base_url.clone(),
+                config.max_tokens,
+            ),
+            registry: Arc::clone(registry),
+            config,
+            messages: Vec::new(),
+            deny_writes: true,
         }
     }
 
@@ -247,6 +264,19 @@ impl AgentLoop {
 
                 if name == "write" {
                     let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+                    if self.deny_writes {
+                        let result = ToolResult {
+                            tool_call_id: id.clone(),
+                            content: format!(
+                                "Write denied: cannot write to {} (writes are disabled for sub-agents). Request the parent agent to perform the write instead.",
+                                file_path
+                            ),
+                            is_error: true,
+                        };
+                        let _ = tx.send(AgentEvent::ToolCallEnd(result.clone()));
+                        tool_results.push(result);
+                        continue;
+                    }
                     let (resume_tx, resume_rx) = oneshot::channel();
                     let _ = tx.send(AgentEvent::WriteRequest {
                         path: file_path.to_string(),
