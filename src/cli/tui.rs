@@ -1,9 +1,8 @@
-use std::cell::Cell;
 use std::io::{self, stdout};
 use std::path::PathBuf;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -40,22 +39,22 @@ impl ThemeColors {
     fn new(theme: Theme) -> Self {
         match theme {
             Theme::Dark => Self {
-                user: Color::Cyan,
-                ai: Color::Green,
-                tool: Color::Magenta,
-                tool_result: Color::DarkGray,
-                system: Color::DarkGray,
-                separator: Color::DarkGray,
-                error: Color::Red,
+                user: Color::Rgb(122, 162, 247),
+                ai: Color::Rgb(158, 206, 106),
+                tool: Color::Rgb(187, 154, 247),
+                tool_result: Color::Rgb(86, 95, 137),
+                system: Color::Rgb(115, 125, 170),
+                separator: Color::Rgb(54, 59, 80),
+                error: Color::Rgb(247, 118, 142),
             },
             Theme::Light => Self {
-                user: Color::Blue,
-                ai: Color::Green,
-                tool: Color::Magenta,
-                tool_result: Color::Gray,
-                system: Color::Gray,
-                separator: Color::Gray,
-                error: Color::Red,
+                user: Color::Rgb(0, 102, 204),
+                ai: Color::Rgb(30, 130, 30),
+                tool: Color::Rgb(130, 80, 200),
+                tool_result: Color::Rgb(140, 140, 140),
+                system: Color::Rgb(120, 120, 120),
+                separator: Color::Rgb(200, 200, 200),
+                error: Color::Rgb(200, 30, 30),
             },
         }
     }
@@ -155,8 +154,6 @@ struct App {
     messages: Vec<ChatLine>,
     input: TextArea<'static>,
     scroll_offset: usize,
-    last_total_lines: Cell<usize>,
-    last_visible: Cell<usize>,
     is_thinking: bool,
     status: String,
     quit: bool,
@@ -192,10 +189,11 @@ impl App {
         let mut input = TextArea::default();
         input.set_block(
             Block::default()
-                .borders(Borders::ALL)
-                .title(" Input (Enter to send, Esc to quit, Ctrl+X for menu) "),
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(colors.separator)),
         );
-        input.set_placeholder_text("Type your message...");
+        input.set_placeholder_text("Type a message...");
+        input.set_placeholder_style(Style::default().fg(colors.tool_result));
         input.set_cursor_line_style(Style::default());
 
         Self {
@@ -205,8 +203,6 @@ impl App {
             ],
             input,
             scroll_offset: 0,
-            last_total_lines: Cell::new(usize::MAX / 2),
-            last_visible: Cell::new(1),
             is_thinking: false,
             status: String::new(),
             quit: false,
@@ -263,14 +259,7 @@ impl App {
                     }
                 }
                 KeyCode::Esc => self.quit = true,
-                KeyCode::PageUp => {
-                    let max = self
-                        .last_total_lines
-                        .get()
-                        .saturating_sub(self.last_visible.get())
-                        .max(1);
-                    self.scroll_offset = self.scroll_offset.saturating_add(5).min(max);
-                }
+                KeyCode::PageUp => self.scroll_offset = self.scroll_offset.saturating_add(5),
                 KeyCode::PageDown => self.scroll_offset = self.scroll_offset.saturating_sub(5),
                 _ => {
                     self.input.input(key);
@@ -278,19 +267,10 @@ impl App {
             },
             Event::Mouse(mouse) => match mouse.kind {
                 event::MouseEventKind::ScrollUp => {
-                    let max = self
-                        .last_total_lines
-                        .get()
-                        .saturating_sub(self.last_visible.get())
-                        .max(1);
-                    self.scroll_offset = self.scroll_offset.saturating_add(3).min(max);
+                    self.scroll_offset = self.scroll_offset.saturating_add(1);
                 }
                 event::MouseEventKind::ScrollDown => {
-                    if self.scroll_offset <= 3 {
-                        self.scroll_offset = 0;
-                    } else {
-                        self.scroll_offset -= 3;
-                    }
+                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
                 }
                 _ => {}
             },
@@ -303,10 +283,11 @@ impl App {
         self.input = TextArea::default();
         self.input.set_block(
             Block::default()
-                .borders(Borders::ALL)
-                .title(" Input (Enter to send, Esc to quit, Ctrl+X for menu) "),
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(self.colors.separator)),
         );
-        self.input.set_placeholder_text("Type your message...");
+        self.input.set_placeholder_text("Type a message...");
+        self.input.set_placeholder_style(Style::default().fg(self.colors.tool_result));
         self.input.set_cursor_line_style(Style::default());
     }
 
@@ -667,7 +648,7 @@ fn list_teams_simple() -> Vec<(String, String)> {
 impl Tui {
     pub fn new() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen)?;
+        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         let backend = ratatui::backend::CrosstermBackend::new(stdout());
         let terminal = Terminal::new(backend)?;
         Ok(Self {
@@ -764,7 +745,7 @@ impl Tui {
 
     pub fn shutdown(mut self) -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         self.terminal.show_cursor()?;
         Ok(())
     }
@@ -773,63 +754,55 @@ impl Tui {
 fn render(f: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(6)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
         .split(f.area());
 
-    let chat_area = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(outer[0]);
-
-    render_status(f, chat_area[0], app);
-    render_chat(f, chat_area[1], app);
-    render_input(f, outer[1], app);
+    render_status(f, outer[0], app);
+    render_chat(f, outer[1], app);
+    render_input(f, outer[2], app);
     if app.menu_active() {
         render_menu(f, f.area(), app);
     }
 }
 
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
-    let theme = app.theme;
     let (text, color) = if let Some(ref err) = app.error {
-        (format!(" Error: {}", err), Color::Red)
-    } else if let Some(ref path) = app.confirm_prompt {
-        (format!(" Allow write to {}? (y/n) ", path), Color::Yellow)
+        (format!("  {}", err), app.colors.error)
+    } else if let Some(ref _path) = app.confirm_prompt {
+        ("  Allow write? (y/n)".to_string(), Color::Rgb(224, 175, 104))
     } else if app.menu_active() {
-        (" Ctrl+X Menu  |  Esc: Close".into(), Color::Yellow)
+        ("  Ctrl+X Menu  ·  Esc: Close".into(), Color::Rgb(224, 175, 104))
     } else if app.is_thinking {
-        (format!(" {} {}", spinner_char(), app.status), Color::Yellow)
+        (format!("  ⟳ {}", app.status), Color::Rgb(224, 175, 104))
     } else if !app.status.is_empty() {
-        (format!(" {}", app.status), Color::Cyan)
+        (format!("  {}", app.status), app.colors.user)
     } else {
-        let mode = if app.is_planning { "Planning" } else { "Ready" };
+        let mode = if app.is_planning { "plan" } else { "ready" };
         let mode_color = if app.is_planning {
-            Color::Blue
+            Color::Rgb(224, 175, 104)
         } else {
-            Color::Green
+            Color::Rgb(158, 206, 106)
         };
-        let theme_indicator = match theme {
+        let indicator = match app.theme {
             Theme::Dark => "☾",
             Theme::Light => "☀",
         };
         let info = if app.model_info.is_empty() {
-            format!(" {}  |  {}  |  Ctrl+X Menu", mode, theme_indicator)
+            format!(" {}  ·  {}  ·  Ctrl+X", mode, indicator)
         } else {
-            format!(
-                " {}  |  {}  |  {}  |  Ctrl+X Menu",
-                mode, app.model_info, theme_indicator
-            )
+            format!(" {}  ·  {}  ·  {}  ·  Ctrl+X", mode, app.model_info, indicator)
         };
         (info, mode_color)
     };
 
-    let bg = match theme {
-        Theme::Dark => Color::DarkGray,
-        Theme::Light => Color::White,
-    };
-    let para = Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color))))
-        .block(Block::default().style(Style::default().bg(bg)));
-    f.render_widget(para, area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
+        area,
+    );
 }
 
 fn render_menu(f: &mut Frame, screen: Rect, app: &App) {
@@ -839,19 +812,31 @@ fn render_menu(f: &mut Frame, screen: Rect, app: &App) {
             let mut ml: Vec<Line> = vec![Line::from("")];
             for (i, item) in MENU_ITEMS.iter().enumerate() {
                 let style = if i == *selected {
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(192, 202, 245),
+                        Theme::Light => Color::Rgb(20, 20, 20),
+                    };
+                    let bg = match app.theme {
+                        Theme::Dark => Color::Rgb(65, 72, 104),
+                        Theme::Light => Color::Rgb(220, 220, 220),
+                    };
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
+                        .fg(fg)
+                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(169, 177, 214),
+                        Theme::Light => Color::Rgb(80, 80, 80),
+                    };
+                    Style::default().fg(fg)
                 };
                 ml.push(Line::from(Span::styled(format!("  {}  ", item), style)));
             }
             ml.push(Line::from(""));
             ml.push(Line::from(Span::styled(
                 "  arrows  Enter  Esc  ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.colors.tool_result),
             )));
             (" Menu ", ml)
         }
@@ -859,19 +844,31 @@ fn render_menu(f: &mut Frame, screen: Rect, app: &App) {
             let mut ml: Vec<Line> = vec![Line::from("")];
             for (i, name) in sessions.iter().enumerate() {
                 let style = if i == *selected {
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(192, 202, 245),
+                        Theme::Light => Color::Rgb(20, 20, 20),
+                    };
+                    let bg = match app.theme {
+                        Theme::Dark => Color::Rgb(65, 72, 104),
+                        Theme::Light => Color::Rgb(220, 220, 220),
+                    };
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
+                        .fg(fg)
+                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(169, 177, 214),
+                        Theme::Light => Color::Rgb(80, 80, 80),
+                    };
+                    Style::default().fg(fg)
                 };
                 ml.push(Line::from(Span::styled(format!("  {}  ", name), style)));
             }
             ml.push(Line::from(""));
             ml.push(Line::from(Span::styled(
                 "  Enter=select  Esc=back  ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.colors.tool_result),
             )));
             (" Sessions ", ml)
         }
@@ -879,19 +876,31 @@ fn render_menu(f: &mut Frame, screen: Rect, app: &App) {
             let mut ml: Vec<Line> = vec![Line::from("")];
             for (i, name) in models.iter().enumerate() {
                 let style = if i == *selected {
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(192, 202, 245),
+                        Theme::Light => Color::Rgb(20, 20, 20),
+                    };
+                    let bg = match app.theme {
+                        Theme::Dark => Color::Rgb(65, 72, 104),
+                        Theme::Light => Color::Rgb(220, 220, 220),
+                    };
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
+                        .fg(fg)
+                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(169, 177, 214),
+                        Theme::Light => Color::Rgb(80, 80, 80),
+                    };
+                    Style::default().fg(fg)
                 };
                 ml.push(Line::from(Span::styled(format!("  {}  ", name), style)));
             }
             ml.push(Line::from(""));
             ml.push(Line::from(Span::styled(
                 "  Enter=select  Esc=back  ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.colors.tool_result),
             )));
             (" Models ", ml)
         }
@@ -899,19 +908,31 @@ fn render_menu(f: &mut Frame, screen: Rect, app: &App) {
             let mut ml: Vec<Line> = vec![Line::from("")];
             for (i, (_, name)) in experts.iter().enumerate() {
                 let style = if i == *selected {
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(192, 202, 245),
+                        Theme::Light => Color::Rgb(20, 20, 20),
+                    };
+                    let bg = match app.theme {
+                        Theme::Dark => Color::Rgb(65, 72, 104),
+                        Theme::Light => Color::Rgb(220, 220, 220),
+                    };
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
+                        .fg(fg)
+                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(169, 177, 214),
+                        Theme::Light => Color::Rgb(80, 80, 80),
+                    };
+                    Style::default().fg(fg)
                 };
                 ml.push(Line::from(Span::styled(format!("  {}  ", name), style)));
             }
             ml.push(Line::from(""));
             ml.push(Line::from(Span::styled(
                 "  Enter=select  Esc=back  ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.colors.tool_result),
             )));
             (" Experts ", ml)
         }
@@ -919,19 +940,31 @@ fn render_menu(f: &mut Frame, screen: Rect, app: &App) {
             let mut ml: Vec<Line> = vec![Line::from("")];
             for (i, (_, name)) in teams.iter().enumerate() {
                 let style = if i == *selected {
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(192, 202, 245),
+                        Theme::Light => Color::Rgb(20, 20, 20),
+                    };
+                    let bg = match app.theme {
+                        Theme::Dark => Color::Rgb(65, 72, 104),
+                        Theme::Light => Color::Rgb(220, 220, 220),
+                    };
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
+                        .fg(fg)
+                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    let fg = match app.theme {
+                        Theme::Dark => Color::Rgb(169, 177, 214),
+                        Theme::Light => Color::Rgb(80, 80, 80),
+                    };
+                    Style::default().fg(fg)
                 };
                 ml.push(Line::from(Span::styled(format!("  {}  ", name), style)));
             }
             ml.push(Line::from(""));
             ml.push(Line::from(Span::styled(
                 "  Enter=select  Esc=back  ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.colors.tool_result),
             )));
             (" Team ", ml)
         }
@@ -941,57 +974,67 @@ fn render_menu(f: &mut Frame, screen: Rect, app: &App) {
             } else {
                 "*".repeat(input.len())
             };
+            let fg_label = match app.theme {
+                Theme::Dark => Color::Rgb(192, 202, 245),
+                Theme::Light => Color::Rgb(30, 30, 30),
+            };
             (
                 " Configure API ",
                 vec![
                     Line::from(""),
                     Line::from(Span::styled(
                         "  Enter your API key:  ",
-                        Style::default().fg(Color::White),
+                        Style::default().fg(fg_label),
                     )),
                     Line::from(Span::styled(
                         format!("  > {}  ", display),
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(Color::Rgb(224, 175, 104))
                             .add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
                     Line::from(Span::styled(
                         "  Enter=confirm  Esc=back  ",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(app.colors.tool_result),
                     )),
                 ],
             )
         }
-        SubMenu::Help => (
-            " Help ",
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  AI Code Agent  ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from("  Enter      — send message"),
-                Line::from("  Ctrl+X     — open menu"),
-                Line::from("  Esc        — quit / close menu"),
-                Line::from("  PgUp/PgDn  — scroll"),
-                Line::from("  Mouse      — scroll"),
-                Line::from(""),
-                Line::from("  /help      — commands"),
-                Line::from("  /plan      — planning mode"),
-                Line::from("  /execute   — execution mode"),
-                Line::from("  /clear     — fresh chat"),
-                Line::from("  /quit      — exit"),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Esc/Enter=back  ",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ],
-        ),
+        SubMenu::Help => {
+            let accent = match app.theme {
+                Theme::Dark => Color::Rgb(122, 162, 247),
+                Theme::Light => Color::Rgb(0, 102, 204),
+            };
+            (
+                " Help ",
+                vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  AI Code Agent  ",
+                        Style::default()
+                            .fg(accent)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from("  Enter      — send message"),
+                    Line::from("  Ctrl+X     — open menu"),
+                    Line::from("  Esc        — quit / close menu"),
+                    Line::from("  PgUp/PgDn  — scroll"),
+                    Line::from("  Mouse      — scroll"),
+                    Line::from(""),
+                    Line::from("  /help      — commands"),
+                    Line::from("  /plan      — planning mode"),
+                    Line::from("  /execute   — execution mode"),
+                    Line::from("  /clear     — fresh chat"),
+                    Line::from("  /quit      — exit"),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Esc/Enter=back  ",
+                        Style::default().fg(app.colors.tool_result),
+                    )),
+                ],
+            )
+        }
     };
 
     let height = lines.len() as u16 + 2;
@@ -1001,21 +1044,22 @@ fn render_menu(f: &mut Frame, screen: Rect, app: &App) {
     let menu_area = Rect::new(x, y, width.min(screen.width), height.min(screen.height));
     f.render_widget(Clear, menu_area);
 
+    let bg_color = match app.theme {
+        Theme::Dark => Color::Rgb(36, 40, 59),
+        Theme::Light => Color::Rgb(245, 245, 245),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.colors.separator))
         .title(title)
-        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+        .style(Style::default().bg(bg_color));
     let inner = block.inner(menu_area);
     f.render_widget(block, menu_area);
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn render_chat(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(" Chat ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let width = inner.width.saturating_sub(4) as usize;
+    let width = area.width.saturating_sub(4) as usize;
     let c = &app.colors;
     let mut lines: Vec<Line> = Vec::new();
 
@@ -1046,7 +1090,7 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
             }
             ChatLine::ToolStart { name } => {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  [tool: {}]", name),
+                    format!("  · {} ", name),
                     Style::default().fg(c.tool).add_modifier(Modifier::ITALIC),
                 )]));
             }
@@ -1082,32 +1126,28 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let total_lines = lines.len();
-    let visible = inner.height as usize;
-    app.last_total_lines.set(total_lines);
-    app.last_visible.set(visible);
+    let visible = area.height as usize;
 
     if total_lines > visible {
-        let scroll = if app.scroll_offset == 0 {
-            total_lines.saturating_sub(visible)
-        } else {
-            app.scroll_offset.min(total_lines.saturating_sub(visible))
-        };
+        let max_scroll = total_lines.saturating_sub(visible);
+        let from_bottom = app.scroll_offset.min(max_scroll);
+        let scroll = max_scroll - from_bottom;
         let para = Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
             .scroll((scroll as u16, 0));
-        f.render_widget(para, inner);
-        let mut sb = ScrollbarState::new(total_lines.saturating_sub(visible)).position(scroll);
+        f.render_widget(para, area);
+        let mut sb = ScrollbarState::new(max_scroll).position(scroll);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None),
-            inner,
+            area,
             &mut sb,
         );
     } else {
         f.render_widget(
             Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
-            inner,
+            area,
         );
     }
 }
@@ -1116,9 +1156,4 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(&app.input, area);
 }
 
-fn spinner_char() -> char {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static FRAME: AtomicUsize = AtomicUsize::new(0);
-    let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    frames[FRAME.fetch_add(1, Ordering::Relaxed) % frames.len()]
-}
+
